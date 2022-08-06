@@ -32,7 +32,7 @@ def _get_part(
     conn = ibis.clickhouse.connect(**connection_kwargs)
     expr = conn.sql(f"select * from {database}.{table} where {partition_key} = {partition}")
     conn.close()
-    return expr.execute()
+    return expr.execute(limit=None)
 
 
 @delayed
