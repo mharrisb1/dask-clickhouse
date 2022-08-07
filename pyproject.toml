@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "dask-clickhouse"
-version = "0.3.0-alpha.0"
+version = "0.3.0"
 description = "Dask integration for Clickhouse"
 authors = ["Michael Harris <mharris@luabase.com>"]
 license = "MIT"
@@ -12,7 +12,7 @@ homepage = "https://github.com/mharrisb1/dask-clickhouse"
 python = ">=3.8,<3.11"
 dask = "^2022.7.1"
 pyarrow = "^9.0.0"
-clickhouse-driver = {extras = ["numpy", "lz4"], version = "^0.2.4"}
+ibis-framework = {extras = ["clickhouse"], version = "^3.1.0"}
 
 [tool.poetry.dev-dependencies]
 pytest = "^7.1.2"
