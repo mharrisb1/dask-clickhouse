@@ -1,97 +1,67 @@
-from typing import Any, Dict
+from typing import Any, Dict, List
 
-import ibis
-from ibis.backends.clickhouse import Backend
-
+import pyarrow as pa
 import pandas as pd
-from dask import delayed
+
 import dask.dataframe as dd
+from dask.base import tokenize
+from dask.dataframe.core import new_dd_object
+from dask.delayed import delayed
+from dask.highlevelgraph import HighLevelGraph
+from dask.layers import DataFrameIOLayer
+
+from clickhouse_driver import Client
 
 
-def _get_table_system_info(conn: Backend, database: str, table: str) -> pd.DataFrame:
-    p = conn.table("system.parts")["database", "table", "partition", "rows"]
-    t = conn.table("system.tables")["database", "name", "partition_key", "sorting_key"]
-    expr = p.left_join(t, [p.database == t.database, p.table == t.name])
-    expr = expr[p.database, p.table, p.partition, t.partition_key, t.sorting_key, p.rows]
-    expr = expr.filter([expr.database == database, expr.table == table])
-    expr = expr.groupby([expr.database, expr.table, expr.partition, expr.partition_key, expr.sorting_key]).aggregate(
-        expr.rows.sum().name("rows")
+def _make_arrow_record_batch(batch: List[Any], columns: List[str]) -> pa.RecordBatch:
+    df = pd.DataFrame(batch, columns=columns)
+    return pa.RecordBatch.from_pandas(df)
+
+
+def _fetch_batch(batch: pa.RecordBatch) -> pd.DataFrame:
+    return batch.to_pandas()
+
+
+@delayed
+def _fetch_query_batches(
+        query: str, connection_kwargs: Dict[str, Any], chunk_size: int, **kwargs
+) -> List[pa.RecordBatch]:
+    client = Client(**connection_kwargs)
+    settings = dict(max_block_size=chunk_size)
+    batch_iter = client.execute_iter(query, with_column_types=True, settings=settings, chunk_size=chunk_size, **kwargs)
+    first_batch = next(batch_iter)
+    schema = first_batch.pop(0)
+    columns = [t[0] for t in schema]
+    batches = [_make_arrow_record_batch(first_batch, columns)]
+    batches += [_make_arrow_record_batch(batch, columns) for batch in batch_iter]
+    return batches
+
+
+def read_clickhouse(query: str, connection_kwargs: Dict[str, Any], partitions_size=10000, **kwargs) -> dd.DataFrame:
+    label = "read-clickhouse-"
+    output_name = label + tokenize(
+        query,
+        connection_kwargs,
     )
-    results = expr.execute()
-    return results
 
+    batches: List[pa.RecordBatch] = _fetch_query_batches(
+        query,
+        connection_kwargs, chunk_size=partitions_size,
+        **kwargs
+    ).compute()
+    meta: pd.DataFrame = batches[0].to_pandas()
 
-@delayed
-def _get_part(
-    database: str,
-    table: str,
-    partition: Any,
-    partition_key: str,
-    connection_kwargs: Dict[str, Any],
-) -> pd.DataFrame:
-    conn = ibis.clickhouse.connect(**connection_kwargs)
-    expr = conn.sql(f"select * from {database}.{table} where {partition_key} = {partition}")
-    conn.close()
-    return expr.execute(limit=None)
-
-
-@delayed
-def _get_page(
-    database: str,
-    table: str,
-    sorting_key: str,
-    limit: int,
-    offset: int,
-    connection_kwargs: Dict[str, Any],
-) -> pd.DataFrame:
-    conn = ibis.clickhouse.connect(**connection_kwargs)
-    expr = conn.sql(f"select * from {database}.{table} order by {sorting_key} limit {limit} offset {offset}")
-    conn.close()
-    return expr.execute(limit=limit)
-
-
-def read_from_table(database: str, table: str, connection_kwargs: Dict[str, Any], verbose: bool = False) -> dd.DataFrame:
-    ibis.options.verbose = verbose
-    conn = ibis.clickhouse.connect(**connection_kwargs)
-    part_df = _get_table_system_info(conn, database, table)
-    meta = conn.table(f"{database}.{table}").limit(0).execute()
-    if len(part_df) > 1:
-        parts = []
-        for _, row in part_df.iterrows():
-            df = _get_part(row.database, row.table, row.partition, row.partition_key, connection_kwargs)
-            parts.append(df)
+    if not batches:
+        graph = {(output_name, 0): meta}
+        divisions = (None, None)
     else:
-        parts = []
-        limit = 50000
-        for offset in range(0, part_df.rows.iloc[0], limit):
-            df = _get_page(database, table, part_df.sorting_key.iloc[0], limit, offset, connection_kwargs)
-            parts.append(df)
-
-    return dd.from_delayed(dfs=parts, meta=meta)
-
-
-def write_to_table(
-    ddf: dd.DataFrame,
-    database: str,
-    table: str,
-    connection_kwargs: Dict[str, Any],
-    method: str = "append",
-    verbose: bool = False,
-) -> int:
-    conn = ibis.clickhouse.connect(**connection_kwargs)
-    ibis.options.verbose = verbose
-    if method not in ("append", "overwrite"):
-        raise ValueError("Method must be one of ('append', 'overwrite')")
-
-    if method == "overwrite":
-        conn.raw_sql(f"truncate table {database}.{table}")
-
-    table = conn.table(f"{database}.{table}")
-
-    rows_inserted = 0
-
-    for part in ddf.partitions:
-        r = table.insert(part.compute())
-        rows_inserted += r
-
-    return rows_inserted
+        layer = DataFrameIOLayer(
+            name=output_name,
+            columns=meta.columns,
+            inputs=batches,
+            io_func=_fetch_batch,
+            label=label,
+        )
+        divisions = tuple([None] * (len(batches) + 1))
+        graph = HighLevelGraph({output_name: layer}, {output_name: set()})
+    return new_dd_object(graph, output_name, meta, divisions)
