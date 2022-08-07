@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "dask-clickhouse"
-version = "0.3.0"
+version = "0.3.0-alpha.0"
 description = "Dask integration for Clickhouse"
 authors = ["Michael Harris <mharris@luabase.com>"]
 license = "MIT"
